@@ -329,6 +329,28 @@ def gather_offsets(msl):
     msl = ''.join(out)
     k = msl.index('\n', msl.index('using namespace metal;')) + 1
     return msl[:k] + GATHER4 + msl[k:]
+# The pool table lookup of a raw global access (GlobalToStorage TryGenerateRawStorageOp: the last entry, the chunk's hint, a binary search; then the access through a physical
+# pointer) is a helper function, int / void <name>(address low, address high, [value,] the table, [the write log,] the last entry[, gmem_vec]), and spirv-cross marks every function
+# always_inline. A shader calls it at every raw access, so Metal's compiler built a copy of the search for each: Ocarina of Time's foliage mesh shader 3439aaa071d868ae calls its two
+# helpers 141 times, and its task / mesh pipeline took 1.9 s to compile cold on an M2 Air (25 s for the route's 54 at the first start; 11.5 s and 110 s with a resolve helper of
+# 6 arguments split off), while the GPU waited at its first draw (Native mesh pipelines compiled at their first draw). A helper called more than once is kept as one function the calls
+# branch to: that library is 0.57 -> 0.13 MB and the pipeline compiles in 0.46 s, with the frame time unchanged within the runs' noise (the search is rare: most accesses hit the
+# last entry, and the call is cheap beside the table and memory reads it makes)
+RAW_HELPER = re.compile(r'\nstatic inline __attribute__\(\(always_inline\)\)\n((?:int|uint|void) (\w+)\(([^)]*)\)\n\{)')
+def raw_noinline(msl):
+    if 'reinterpret_cast<' not in msl: return msl
+    out, at = [], 0
+    for m in RAW_HELPER.finditer(msl):
+        params = split_params(m.group(3))
+        if (len(params) < 4 or not all(re.fullmatch(r'thread const int& \w+', p) for p in params[:2])
+                or not any(re.fullmatch(r'(const )?device \w+& cp_s\d+', p) for p in params) or not any(re.fullmatch(r'thread uint& \w+', p) for p in params)):
+            continue
+        end = block_end(msl, m.end() - 1)
+        if 'reinterpret_cast<' not in msl[m.end():end] or len(re.findall(r'\b%s\(' % m.group(2), msl)) < 3: continue   # its definition and two calls
+        out.append(msl[at:m.start()] + '\nstatic __attribute__((noinline))\n'); at = m.start(1)
+    out.append(msl[at:])
+    return ''.join(out)
+
 # Border colours: Maxwell's sampler takes any RGBA border colour, Metal's only transparent black, opaque black or opaque white, and the host's sampler gets the nearest of them
 # (nvn_border.h). A filtered sample is linear in the border colour, r = Σ w·texel + w_border·B, so two samples through samplers that differ only in their border colour give the rest:
 # with Metal colours Bn (the sampler) and Bw (its twin), r = s_n + (s_w - s_n)·k, k = (B - Bn) / (Bw - Bn) per channel. Each sampler member a shader samples gets a twin member
@@ -1673,6 +1695,8 @@ def finish(key, w, j, c1):
         try: src, spill = tg_spill(src)   # shared memory past Metal's 32 KB in a device buffer (see tg_spill)
         except ValueError as e: return 'shared memory rewrite failed', str(e)[:160], None
         if spill: open(msl, 'w').write(src)
+    if 'reinterpret_cast<' in src:
+        src = raw_noinline(src); open(msl, 'w').write(src)   # one copy of each pool table lookup (see raw_noinline)
     pad = []
     if j['stage'] == 'vs':   # outputs start as (0,0,0,1) (see vs_init); no point size beside a layer output (see vs_layer); the base instance from Metal (see vs_base_instance)
         src = vs_base_instance(vs_layer(vs_init(src))); open(msl, 'w').write(src)
